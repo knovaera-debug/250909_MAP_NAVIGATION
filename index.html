@@ -2,12 +2,21 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <title>実車評価支援ツール（iPhone音声選択対応・GPX保存先/ファイル名指定・最近傍読み上げ）</title>
+  <title>実車評価支援ツール（修正版：地図読み込み安定・GPX保存先/ファイル名指定・最近傍読み上げ）</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="leaflet.css" />
+
+  <!-- Leaflet を CDN から読み込み（404/キャッシュ不整合の回避） -->
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin=""/>
   <style>
     html, body { height:100%; margin:0; }
-    #map { position:absolute; top:0; bottom:0; right:0; left:0; }
+    #map {
+      position:absolute; top:0; bottom:0; right:0; left:0;
+      /* CSS不整合時に高さ0にならないよう保険 */
+      min-height: 60vh;
+    }
     #panel{
       position:absolute; top:8px; left:8px; right:8px;
       background:white; padding:10px; border-radius:12px;
@@ -22,6 +31,7 @@
     .counts{ font-size:12px; margin-left:auto; }
     .small{ font-size:12px; color:#333; }
 
+    /* iPhone等の狭い画面でコンパクト化 */
     @media (max-width:480px){
       #panel{ padding:8px 10px; border-radius:10px; font-size:12px; }
       h1{ font-size:13px; }
@@ -66,6 +76,7 @@
 
       <div class="row">
         <button id="tts">音声テスト</button>
+        <!-- 端末側で選べるように UI は出すが、強制はしない -->
         <select id="voiceSelect" class="small" style="min-width:200px"></select>
         <button id="wake">画面オフ防止: OFF</button>
       </div>
@@ -90,233 +101,308 @@
 
   <button id="fabStop">終了</button>
 
-  <script src="leaflet.js"></script>
+  <!-- 依存ライブラリ（ローカルでOK） -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script src="jszip.min.js"></script>
   <script src="togeojson.umd.js"></script>
+
   <script>
-    // 地図初期化
-    const map = L.map('map').setView([35.0, 135.0], 13);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap contributors' }).addTo(map);
+    // DOM が準備できてから初期化（要素未存在で失敗するのを防ぐ）
+    document.addEventListener('DOMContentLoaded', function(){
 
-    // 自車マーカー（赤丸）
-    const carIcon = L.divIcon({
-      className: 'custom-car',
-      html: '<div style="width:16px;height:16px;background:red;border-radius:50%;"></div>',
-      iconSize: [16,16], iconAnchor: [8,8]
-    });
-    const carMarker = L.marker([35.0, 135.0], {icon:carIcon}).addTo(map);
+      // ====== 地図初期化 ======
+      const map = L.map('map').setView([35.0, 135.0], 13);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors'
+      }).addTo(map);
 
-    // ====== TTS ======
-    const ttsRate = document.getElementById('ttsRate');
-    const ttsRateVal = document.getElementById('ttsRateVal');
-    const voiceSelect = document.getElementById('voiceSelect');
+      // 自車マーカー（赤塗り）
+      const carIcon = L.divIcon({
+        className: 'custom-car',
+        html: '<div style="width:16px;height:16px;background:red;border-radius:50%;"></div>',
+        iconSize: [16,16], iconAnchor: [8,8]
+      });
+      const carMarker = L.marker([35.0, 135.0], {icon:carIcon}).addTo(map);
 
-    let voicesCache = [];
-    let selectedVoice = null;
+      // ====== TTS（端末側の選択を尊重） ======
+      const ttsRate = document.getElementById('ttsRate');
+      const ttsRateVal = document.getElementById('ttsRateVal');
+      const voiceSelect = document.getElementById('voiceSelect');
 
-    function populateVoiceSelect(){
-      voicesCache = window.speechSynthesis.getVoices();
-      if (!voicesCache.length) return;
-      const ordered = voicesCache;
-      const saved = localStorage.getItem('voiceName');
-      selectedVoice = ordered.find(v => v.name === saved) || ordered[0];
-      if (voiceSelect){
-        voiceSelect.innerHTML = '';
-        ordered.forEach(v => {
-          const opt = document.createElement('option');
-          opt.value = v.name;
-          opt.textContent = `${v.name} (${v.lang})`;
-          if (selectedVoice && v.name === selectedVoice.name) opt.selected = true;
-          voiceSelect.appendChild(opt);
-        });
+      let voicesCache = [];
+      let selectedVoice = null;
+
+      function populateVoiceSelect(){
+        voicesCache = window.speechSynthesis.getVoices();
+        if (!voicesCache.length) return;
+        const ordered = voicesCache;
+        const saved = localStorage.getItem('voiceName');
+        selectedVoice = ordered.find(v => v.name === saved) || ordered[0];
+        if (voiceSelect){
+          voiceSelect.innerHTML = '';
+          ordered.forEach(v => {
+            const opt = document.createElement('option');
+            opt.value = v.name;
+            opt.textContent = `${v.name} (${v.lang})`;
+            if (selectedVoice && v.name === selectedVoice.name) opt.selected = true;
+            voiceSelect.appendChild(opt);
+          });
+        }
       }
-    }
 
-    function speak(text){
-      const u = new SpeechSynthesisUtterance(text);
-      if (!voicesCache.length) populateVoiceSelect();
-      if (selectedVoice) u.voice = selectedVoice;
-      u.rate  = parseFloat(ttsRate.value || '1.0');
-      window.speechSynthesis.speak(u);
-    }
+      function speak(text){
+        const u = new SpeechSynthesisUtterance(text);
+        if (!voicesCache.length) populateVoiceSelect();
+        if (selectedVoice) u.voice = selectedVoice;   // ← 端末で選んだ声をそのまま使用
+        u.rate  = parseFloat(ttsRate.value || '1.0');
+        window.speechSynthesis.speak(u);
+      }
 
-    voiceSelect.addEventListener('change', ()=>{
-      const name = voiceSelect.value;
-      selectedVoice = (window.speechSynthesis.getVoices() || []).find(v => v.name === name) || selectedVoice;
-      localStorage.setItem('voiceName', name);
-    });
+      voiceSelect.addEventListener('change', ()=>{
+        const name = voiceSelect.value;
+        selectedVoice = (window.speechSynthesis.getVoices() || []).find(v => v.name === name) || selectedVoice;
+        localStorage.setItem('voiceName', name);
+      });
+      window.speechSynthesis.onvoiceschanged = populateVoiceSelect;
+      setTimeout(populateVoiceSelect, 300);
 
-    window.speechSynthesis.onvoiceschanged = populateVoiceSelect;
-    setTimeout(populateVoiceSelect, 300);
+      document.getElementById('tts').addEventListener('click',()=>{
+        if (!voicesCache.length) populateVoiceSelect();
+        speak('音声テストです。');
+      });
+      ttsRate.addEventListener('input',()=>{ ttsRateVal.textContent = ttsRate.value; });
 
-    document.getElementById('tts').addEventListener('click',()=>{
-      if (!voicesCache.length) populateVoiceSelect();
-      speak('音声テストです。');
-    });
-    ttsRate.addEventListener('input',()=>{ ttsRateVal.textContent = ttsRate.value; });
+      // ====== 追跡 ======
+      let watching = null;
+      let tracking = false;
+      let points = [];
+      let poly = L.polyline([], { color:'#d00', weight:4 }).addTo(map);
 
-    // ====== 追跡 ======
-    let watching = null;
-    let tracking = false;
-    let points = [];
-    let poly = L.polyline([], { color:'#d00', weight:4 }).addTo(map);
+      const startBtn = document.getElementById('start');
+      const stopBtn  = document.getElementById('stop');
+      const fabStop  = document.getElementById('fabStop');
+      const recenterBtn = document.getElementById('recenter');
+      const cpBtn = document.getElementById('cp');
+      const keepCentered = document.getElementById('keepCentered');
+      const counts = document.getElementById('counts');
 
-    const startBtn = document.getElementById('start');
-    const stopBtn  = document.getElementById('stop');
-    const fabStop  = document.getElementById('fabStop');
-    const recenterBtn = document.getElementById('recenter');
-    const cpBtn = document.getElementById('cp');
-    const keepCentered = document.getElementById('keepCentered');
-    const counts = document.getElementById('counts');
+      function updateCounts(){ counts.textContent = `点:${points.length}`; }
 
-    function updateCounts(){ counts.textContent = `点:${points.length}`; }
+      function onLoc(pos){
+        const { latitude:lat, longitude:lon } = pos.coords;
+        const now = new Date();
+        carMarker.setLatLng([lat, lon]);
+        if (tracking){
+          points.push({lat, lon, time: now.toISOString()});
+          poly.addLatLng([lat, lon]);
+          updateCounts();
+        }
+        if (keepCentered.checked) map.setView([lat, lon]);
+        maybeAnnounceNearestPOI(lat, lon);
+      }
+      function onLocErr(err){ console.warn(err); }
 
-    function onLoc(pos){
-      const { latitude:lat, longitude:lon } = pos.coords;
-      const now = new Date();
-      carMarker.setLatLng([lat, lon]);
-      if (tracking){
-        points.push({lat, lon, time: now.toISOString()});
-        poly.addLatLng([lat, lon]);
+      function startTracking(){
+        if (tracking) return;
+        tracking = true;
+        startBtn.disabled = true; stopBtn.disabled = false; cpBtn.disabled = false;
+        fabStop.style.display = 'block';
+        speak('追跡を開始します。');
+        if (!watching) watching = navigator.geolocation.watchPosition(onLoc, onLocErr, { enableHighAccuracy:true, maximumAge:2000, timeout:10000 });
+        document.getElementById('adv').open = false; // モバイルで視界を広く
+      }
+      function stopTracking(){
+        if (!tracking) return;
+        tracking = false;
+        startBtn.disabled = false; stopBtn.disabled = true; cpBtn.disabled = true;
+        fabStop.style.display = 'none';
+        speak('追跡を終了しました。');
+        document.getElementById('saveGpx').disabled = points.length === 0;
+        document.getElementById('adv').open = true;
         updateCounts();
       }
-      if (keepCentered.checked) map.setView([lat, lon]);
-      maybeAnnounceNearestPOI(lat, lon);
-    }
-    function onLocErr(err){ console.warn(err); }
 
-    function startTracking(){
-      if (tracking) return;
-      tracking = true;
-      startBtn.disabled = true; stopBtn.disabled = false; cpBtn.disabled = false;
-      fabStop.style.display = 'block';
-      speak('追跡を開始します。');
-      if (!watching) watching = navigator.geolocation.watchPosition(onLoc, onLocErr, { enableHighAccuracy:true, maximumAge:2000, timeout:10000 });
-      document.getElementById('adv').open = false;
-    }
+      startBtn.addEventListener('click', startTracking);
+      stopBtn.addEventListener('click', stopTracking);
+      fabStop.addEventListener('click', stopTracking);
 
-    function stopTracking(){
-      if (!tracking) return;
-      tracking = false;
-      startBtn.disabled = false; stopBtn.disabled = true; cpBtn.disabled = true;
-      fabStop.style.display = 'none';
-      speak('追跡を終了しました。');
-      document.getElementById('saveGpx').disabled = points.length === 0;
-      document.getElementById('adv').open = true;
-      updateCounts();
-    }
-
-    startBtn.addEventListener('click', startTracking);
-    stopBtn.addEventListener('click', stopTracking);
-    fabStop.addEventListener('click', stopTracking);
-
-    recenterBtn.addEventListener('click', ()=>{
-      if (points.length){
-        const p = points[points.length-1];
-        map.setView([p.lat, p.lon]);
-      }
-    });
-
-    // チェックポイント
-    let cpLayer = L.layerGroup().addTo(map);
-    cpBtn.addEventListener('click', ()=>{
-      if (!points.length) return;
-      const p = points[points.length-1];
-      L.circleMarker([p.lat, p.lon], { radius:6, color:'#a00', weight:2, fillColor:'#f66', fillOpacity:0.9 }).addTo(cpLayer);
-      speak('チェックポイント。');
-    });
-
-    // GPX保存
-    function buildGpx(){
-      if (!points.length) return '';
-      const header = `<?xml version="1.0" encoding="UTF-8"?>\\n`+
-        `<gpx version="1.1" creator="RouteHelper" xmlns="http://www.topografix.com/GPX/1/1">\\n`+
-        `<trk><name>track</name><trkseg>`;
-      const body = points.map(p=>`<trkpt lat="${p.lat}" lon="${p.lon}"><time>${p.time}</time></trkpt>`).join('');
-      return header + body + `</trkseg></trk></gpx>`;
-    }
-
-    async function saveTextFileInteractively(defaultName, text){
-      const blob = new Blob([text], {type:'application/gpx+xml'});
-      if (window.showSaveFilePicker){
-        try{
-          const handle = await window.showSaveFilePicker({
-            suggestedName: defaultName,
-            types:[{description:'GPX file', accept:{'application/gpx+xml':['.gpx']}}]
-          });
-          const writable = await handle.createWritable();
-          await writable.write(blob); await writable.close();
-          return {ok:true, method:'fs-access'};
-        }catch(e){}
-      }
-      const a=document.createElement('a');
-      a.href=URL.createObjectURL(blob); a.download=defaultName||'track.gpx';
-      document.body.appendChild(a); a.click(); URL.revokeObjectURL(a.href); a.remove();
-      return {ok:true, method:'download'};
-    }
-
-    const saveBtn=document.getElementById('saveGpx');
-    const nameInput=document.getElementById('gpxName');
-    saveBtn.addEventListener('click', async ()=>{
-      const gpx=buildGpx();
-      if(!gpx){alert('GPXデータがありません'); return;}
-      let fn=(nameInput && nameInput.value.trim())||'';
-      if(!fn){
-        const d=new Date();
-        fn=`route_${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}.gpx`;
-        if(nameInput) nameInput.value=fn;
-      }
-      if(!fn.toLowerCase().endsWith('.gpx')) fn+='.gpx';
-      const res=await saveTextFileInteractively(fn,gpx);
-      const stat=document.getElementById('stat');
-      if(stat){
-        stat.textContent=res.method==='fs-access'?'保存しました（指定場所）':'保存しました（ダウンロード）';
-        setTimeout(()=>stat.textContent='',3000);
-      }
-    });
-
-    // POI 読み上げ
-    const notifyRangeInput=document.getElementById('notifyRange');
-    const notifyRangeVal=document.getElementById('notifyRangeVal');
-    notifyRangeInput.addEventListener('input',()=>{notifyRangeVal.textContent=notifyRangeInput.value;});
-    const poiList=[];
-    function htmlToPlain(html){if(!html)return'';const el=document.createElement('div');el.innerHTML=html;return (el.textContent||el.innerText||'').replace(/\\s+/g,' ').trim();}
-    function collectPOIsFromGeoJSON(gj){
-      (gj.features||[]).forEach(f=>{
-        if(!f||!f.geometry)return;
-        const props=f.properties||{};
-        if(f.geometry.type==='Point'){const[lon,lat]=f.geometry.coordinates;poiList.push({lat,lon,title:props.name||'',memo:htmlToPlain(props.description),notified:false});}
+      recenterBtn.addEventListener('click', ()=>{
+        if (points.length){
+          const p = points[points.length-1];
+          map.setView([p.lat, p.lon]);
+        }
       });
-    }
-    function haversineMeters(lat1,lon1,lat2,lon2){const R=6371000,toRad=x=>x*Math.PI/180,dLat=toRad(lat2-lat1),dLon=toRad(lon2-lon1);const a=Math.sin(dLat/2)**2+Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;return 2*R*Math.asin(Math.sqrt(a));}
-    let lastSpeakAt=0;const MIN_SPEAK_INTERVAL_MS=5000;
-    function maybeAnnounceNearestPOI(lat,lon){
-      const range=parseFloat(notifyRangeInput.value||'120');
-      const candidates=poiList.filter(p=>!p.notified&&haversineMeters(lat,lon,p.lat,p.lon)<=range).map(p=>({p,d:haversineMeters(lat,lon,p.lat,p.lon)})).sort((a,b)=>a.d-b.d);
-      if(!candidates.length)return;const now=Date.now();if(now-lastSpeakAt<MIN_SPEAK_INTERVAL_MS)return;
-      const nearest=candidates[0].p;const d=Math.round(candidates[0].d);
-      const text=[nearest.title,nearest.memo].filter(Boolean).join('。');
-      speak((text||'評価ポイント')+`。距離 ${d} メートル。`);
-      nearest.notified=true;lastSpeakAt=now;
-    }
 
-    // ファイル読み込み
-    const fileInput=document.getElementById('file');const datasetSelect=document.getElementById('datasetSelect');let datasets={};
-    fileInput.addEventListener('change',async e=>{
-      const files=Array.from(e.target.files||[]);
-      for(const f of files){
-        if(f.name.toLowerCase().endsWith('.kml')){const txt=await f.text();const dom=new DOMParser().parseFromString(txt,'text/xml');const gj=toGeoJSON.kml(dom);addDataset(f.name,gj);}
-        else if(f.name.toLowerCase().endsWith('.kmz')){const zip=await JSZip.loadAsync(await f.arrayBuffer());const kmlEntry=zip.file(/\\.kml$/i)[0];if(kmlEntry){const txt=await kmlEntry.async('text');const dom=new DOMParser().parseFromString(txt,'text/xml');const gj=toGeoJSON.kml(dom);addDataset(f.name.replace(/\\.kmz$/i,'.kml'),gj);}}
+      // チェックポイント
+      let cpLayer = L.layerGroup().addTo(map);
+      cpBtn.addEventListener('click', ()=>{
+        if (!points.length) return;
+        const p = points[points.length-1];
+        L.circleMarker([p.lat, p.lon], { radius:6, color:'#a00', weight:2, fillColor:'#f66', fillOpacity:0.9 }).addTo(cpLayer);
+        speak('チェックポイント。');
+      });
+
+      // ====== GPX生成 & 保存 ======
+      function buildGpx(){
+        if (!points.length) return '';
+        const header =
+          `<?xml version="1.0" encoding="UTF-8"?>\n`+
+          `<gpx version="1.1" creator="RouteHelper" xmlns="http://www.topografix.com/GPX/1/1">\n`+
+          `<trk><name>track</name><trkseg>`;
+        const body = points.map(p=>`<trkpt lat="${p.lat}" lon="${p.lon}"><time>${p.time}</time></trkpt>`).join('');
+        return header + body + `</trkseg></trk></gpx>`;
       }
-    });
-    function addDataset(name,gj){
-      const layer=L.geoJSON(gj,{style:{color:'#0066cc',weight:3},pointToLayer:(f,latlng)=>L.circleMarker(latlng,{radius:6,color:'#0066cc',fillColor:'#66aaff',fillOpacity:0.9})}).addTo(map);
-      map.fitBounds(layer.getBounds(),{padding:[20,20]});datasets[name]={geojson:gj,layer};
-      const opt=document.createElement('option');opt.value=name;opt.textContent=name;datasetSelect.appendChild(opt);
-      collectPOIsFromGeoJSON(gj);
-    }
-    datasetSelect.addEventListener('change',()=>{const sel=datasetSelect.value;Object.entries(datasets).forEach(([n,v])=>{if(v.layer.setStyle)v.layer.setStyle({opacity:n===sel?1:0.35});});});
 
-    // 画面オフ防止
-    const wakeBtn=document.getElementById('wake');let wakeLock=null;
-    async function toggleWake(){if(!wakeLock){try{wakeLock=await
+      async function saveTextFileInteractively(defaultName, text){
+        const blob = new Blob([text], {type:'application/gpx+xml'});
+        // File System Access API（対応環境のみ）
+        if (window.showSaveFilePicker){
+          try{
+            const handle = await window.showSaveFilePicker({
+              suggestedName: defaultName,
+              types:[{description:'GPX file', accept:{'application/gpx+xml':['.gpx']}}]
+            });
+            const writable = await handle.createWritable();
+            await writable.write(blob); await writable.close();
+            return {ok:true, method:'fs-access'};
+          }catch(e){ /* キャンセル等はフォールバック */ }
+        }
+        // ダウンロード（iPhone等は共有シート→“ファイルに保存”で場所を選択）
+        const a=document.createElement('a');
+        a.href=URL.createObjectURL(blob); a.download=defaultName||'track.gpx';
+        document.body.appendChild(a); a.click(); URL.revokeObjectURL(a.href); a.remove();
+        return {ok:true, method:'download'};
+      }
+
+      const saveBtn=document.getElementById('saveGpx');
+      const nameInput=document.getElementById('gpxName');
+      saveBtn.addEventListener('click', async ()=>{
+        const gpx=buildGpx();
+        if(!gpx){alert('GPXデータがありません'); return;}
+        let fn=(nameInput && nameInput.value.trim())||'';
+        if(!fn){
+          const d=new Date();
+          fn=`route_${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}.gpx`;
+          if(nameInput) nameInput.value=fn;
+        }
+        if(!fn.toLowerCase().endsWith('.gpx')) fn+='.gpx';
+        const res=await saveTextFileInteractively(fn,gpx);
+        const stat=document.getElementById('stat');
+        if(stat){
+          stat.textContent=res.method==='fs-access'?'保存しました（指定場所）':'保存しました（ダウンロード）';
+          setTimeout(()=>stat.textContent='',3000);
+        }
+      });
+
+      // ====== POI 読み上げ（タイトル＋メモ / 最近傍優先） ======
+      const notifyRangeInput=document.getElementById('notifyRange');
+      const notifyRangeVal=document.getElementById('notifyRangeVal');
+      notifyRangeInput.addEventListener('input',()=>{ notifyRangeVal.textContent=notifyRangeInput.value; });
+
+      const poiList=[];
+      function htmlToPlain(html){
+        if(!html) return '';
+        const el=document.createElement('div'); el.innerHTML=html;
+        return (el.textContent||el.innerText||'').replace(/\s+/g,' ').trim();
+      }
+      function collectPOIsFromGeoJSON(gj){
+        (gj.features||[]).forEach(f=>{
+          if(!f||!f.geometry) return;
+          const props=f.properties||{};
+          if(f.geometry.type==='Point'){
+            const [lon,lat]=f.geometry.coordinates;
+            poiList.push({lat,lon,title:props.name||props.Title||'', memo:htmlToPlain(props.description||props.Description), notified:false});
+          } else if (f.geometry.type==='GeometryCollection' && Array.isArray(f.geometry.geometries)){
+            f.geometry.geometries.forEach(g=>{
+              if(g.type==='Point'){
+                const [lon,lat]=g.coordinates;
+                poiList.push({lat,lon,title:props.name||props.Title||'', memo:htmlToPlain(props.description||props.Description), notified:false});
+              }
+            });
+          }
+        });
+      }
+      function haversineMeters(lat1,lon1,lat2,lon2){
+        const R=6371000,toRad=x=>x*Math.PI/180;
+        const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+        const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+        return 2*R*Math.asin(Math.sqrt(a));
+      }
+      let lastSpeakAt=0; const MIN_SPEAK_INTERVAL_MS=5000;
+      function maybeAnnounceNearestPOI(lat,lon){
+        const range=parseFloat(notifyRangeInput.value||'120');
+        const candidates=poiList
+          .filter(p=>!p.notified && haversineMeters(lat,lon,p.lat,p.lon)<=range)
+          .map(p=>({p,d:haversineMeters(lat,lon,p.lat,p.lon)}))
+          .sort((a,b)=>a.d-b.d);
+        if(!candidates.length) return;
+        const now=Date.now();
+        if(now-lastSpeakAt<MIN_SPEAK_INTERVAL_MS) return;
+        const nearest=candidates[0].p; const d=Math.round(candidates[0].d);
+        const text=[nearest.title, nearest.memo].filter(Boolean).join('。');
+        speak((text||'評価ポイント')+`。距離 ${d} メートル。`);
+        nearest.notified=true; lastSpeakAt=now;
+      }
+
+      // ====== KML/KMZ 読み込み ======
+      const fileInput=document.getElementById('file');
+      const datasetSelect=document.getElementById('datasetSelect');
+      let datasets={};
+      fileInput.addEventListener('change', async e=>{
+        const files=Array.from(e.target.files||[]);
+        for(const f of files){
+          if(f.name.toLowerCase().endsWith('.kml')){
+            const txt=await f.text();
+            const dom=new DOMParser().parseFromString(txt,'text/xml');
+            const gj=toGeoJSON.kml(dom);
+            addDataset(f.name, gj);
+          } else if (f.name.toLowerCase().endsWith('.kmz')){
+            const zip=await JSZip.loadAsync(await f.arrayBuffer());
+            const kmlEntry=zip.file(/\.kml$/i)[0];
+            if(kmlEntry){
+              const txt=await kmlEntry.async('text');
+              const dom=new DOMParser().parseFromString(txt,'text/xml');
+              const gj=toGeoJSON.kml(dom);
+              addDataset(f.name.replace(/\.kmz$/i,'.kml'), gj);
+            }
+          }
+        }
+      });
+      function addDataset(name,gj){
+        const layer=L.geoJSON(gj,{
+          style:{ color:'#0066cc', weight:3 },
+          pointToLayer:(feat,latlng)=>L.circleMarker(latlng,{ radius:6, color:'#0066cc', weight:2, fillColor:'#66aaff', fillOpacity:0.9 })
+        }).addTo(map);
+        map.fitBounds(layer.getBounds(), {padding:[20,20]});
+        datasets[name]={ geojson:gj, layer };
+        const opt=document.createElement('option'); opt.value=name; opt.textContent=name; datasetSelect.appendChild(opt);
+        collectPOIsFromGeoJSON(gj); // 読み上げ対象に取り込み
+      }
+      datasetSelect.addEventListener('change', ()=>{
+        const sel=datasetSelect.value;
+        Object.entries(datasets).forEach(([n,v])=>{
+          if(v.layer.setStyle) v.layer.setStyle({opacity: n===sel?1:0.35});
+        });
+      });
+
+      // ====== 画面オフ防止 ======
+      const wakeBtn=document.getElementById('wake'); let wakeLock=null;
+      async function toggleWake(){
+        if(!wakeLock){
+          try{ wakeLock=await navigator.wakeLock.request('screen'); wakeBtn.textContent='画面オフ防止: ON'; }
+          catch(e){ alert('この端末/ブラウザは画面オフ防止に対応していない可能性があります。'); }
+        }else{
+          try{ await wakeLock.release(); }catch(e){}
+          wakeLock=null; wakeBtn.textContent='画面オフ防止: OFF';
+        }
+      }
+      wakeBtn.addEventListener('click', toggleWake);
+
+      // 初期状態
+      document.getElementById('saveGpx').disabled = true;
+      updateCounts();
+    });
+  </script>
+</body>
+</html>
