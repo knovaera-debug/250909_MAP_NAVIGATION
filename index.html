@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <title>実車評価支援ツール（初期近傍読み上げ・終了時保存・CPメモ・速度/距離）</title>
+  <title>実車評価支援ツール（iOS無音解錠TTS・初期近傍読み上げ・終了時保存・CPメモ・速度/距離）</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
   <!-- Leaflet：CDN -->
@@ -61,7 +61,7 @@
       <span id="counts" class="counts"></span>
     </div>
 
-    <!-- ★ 速度/距離のHUD -->
+    <!-- 速度/距離のHUD -->
     <div class="row small" id="hud" style="align-items:baseline;">
       <span>速度: <strong><span id="hudSpeed">0.0</span> km/h</strong></span>
       <span style="margin-left:12px;">距離: <strong><span id="hudDist">0.000</span> km</strong></span>
@@ -119,30 +119,58 @@
     });
     const carMarker = L.marker([35.0, 135.0], {icon:carIcon}).addTo(map);
 
-    /* ===== TTS（iPhone設定に従う） ===== */
+    /* ===== TTS（iOS対策：無音で“解錠”してから話す） ===== */
     const ttsRate = document.getElementById('ttsRate');
     const ttsRateVal = document.getElementById('ttsRateVal');
+    let ttsPrimed = false;
+
+    function primeTTSIfNeeded(){
+      if (ttsPrimed) return Promise.resolve();
+      return new Promise(resolve=>{
+        try{ speechSynthesis.cancel(); speechSynthesis.resume(); }catch(e){}
+        const u = new SpeechSynthesisUtterance('\u00A0'); // NBSP（無音）
+        u.lang = 'ja-JP';
+        u.volume = 0;           // 無音で実行→iOSの初回ブロックを解除
+        u.rate = 1;
+        u.onend = ()=>{ ttsPrimed = true; resolve(); };
+        // 念のためタイムアウトで解決
+        const timer = setTimeout(()=>{ ttsPrimed = true; resolve(); }, 1200);
+        u.onend = ()=>{ clearTimeout(timer); ttsPrimed = true; resolve(); };
+        speechSynthesis.speak(u);
+      });
+    }
     function speak(text, onend){
       const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'ja-JP'; // 端末の日本語音声を使う
       u.rate = parseFloat(ttsRate.value || '1.0');
       if (onend) u.onend = onend;
       speechSynthesis.speak(u);
     }
-    document.getElementById('tts').addEventListener('click', ()=>{ speak('音声テストです。'); });
+    document.getElementById('tts').addEventListener('click', async ()=>{
+      await primeTTSIfNeeded();
+      speak('音声テストです。');
+    });
     ttsRate.addEventListener('input', ()=>{ ttsRateVal.textContent = ttsRate.value; });
+
+    // ページ復帰で音声が止まりっぱなしを避ける
+    document.addEventListener('visibilitychange', ()=>{
+      if (document.visibilityState === 'visible'){
+        try{ speechSynthesis.resume(); }catch(e){}
+      }
+    });
 
     /* ===== 追跡 ===== */
     let watching = null;
     let tracking = false;
     let points = [];
-    let lastPos = null;                     // 直近位置（読み上げ・再中心用）
+    let lastPos = null;                     // 直近位置
     const cpList = [];                      // チェックポイント（メモ付き）
     const poly = L.polyline([], { color:'#d00', weight:4 }).addTo(map);
 
-    // ★ 速度/距離 用
-    let totalDistM = 0;                     // 累積距離[m]
-    let lastTrackPoint = null;              // 前回トラック点 {lat, lon, t}
-    let lastSpeedMps = 0;                   // 直近速度[m/s]
+    // 速度/距離
+    let totalDistM = 0;
+    let lastTrackPoint = null;              // {lat, lon, t}
+    let lastSpeedMps = 0;
     const hudSpeed = document.getElementById('hudSpeed');
     const hudDist  = document.getElementById('hudDist');
     function fmt(n, d){ return (isFinite(n)? n : 0).toFixed(d); }
@@ -151,10 +179,7 @@
       if (hudDist)  hudDist.textContent  = fmt(totalDistM / 1000, 3);
     }
     function resetTripStats(){
-      totalDistM = 0;
-      lastTrackPoint = null;
-      lastSpeedMps = 0;
-      updateHUD();
+      totalDistM = 0; lastTrackPoint = null; lastSpeedMps = 0; updateHUD();
     }
 
     const startBtn = document.getElementById('start');
@@ -166,23 +191,22 @@
     const counts = document.getElementById('counts');
     function updateCounts(){ counts.textContent = `点:${points.length}`; }
 
-    // 初期まとめ読み上げ 制御（レース潰し）
+    // 初期まとめ読み上げ 制御
     let initialAnnounced = false;   // 一度だけ
-    let initialAnnouncing = false;  // 実行中は通常アナウンスを抑止
+    let initialAnnouncing = false;  // 実行中は通常アナウンス抑止
 
     function onLoc(pos){
-      const { latitude:lat, longitude:lon, speed } = pos.coords; // speed: m/s (一部端末のみ)
+      const { latitude:lat, longitude:lon, speed } = pos.coords;
       const now = Date.now();
       lastPos = {lat, lon};
       carMarker.setLatLng([lat, lon]);
 
       if (tracking){
-        // 距離/速度の更新
+        // 距離/速度
         if (lastTrackPoint){
           const d = haversineMeters(lat, lon, lastTrackPoint.lat, lastTrackPoint.lon);
-          const dt = Math.max(0.001, (now - lastTrackPoint.t) / 1000); // sec
+          const dt = Math.max(0.001, (now - lastTrackPoint.t) / 1000);
           totalDistM += d;
-          // 速度は coords.speed を優先。無ければ d/dt
           const sp = (typeof speed === 'number' && isFinite(speed) && speed >= 0) ? speed : (d / dt);
           lastSpeedMps = sp;
         } else {
@@ -191,7 +215,7 @@
         lastTrackPoint = { lat, lon, t: now };
         updateHUD();
 
-        // トラック点の保存
+        // トラック
         points.push({lat, lon, time: new Date(now).toISOString()});
         poly.addLatLng([lat, lon]);
         updateCounts();
@@ -208,16 +232,18 @@
     }
     function onLocErr(err){ console.warn(err); }
 
-    function startTracking(){
+    async function startTracking(){
       if (tracking) return;
       tracking = true;
-      resetTripStats(); // ★ 開始時に距離/速度リセット
-      points = [];      // 軌跡も新規開始（必要に応じて保持に変更可）
+      resetTripStats();
+      points = [];
       updateCounts();
 
       startBtn.disabled = true; stopBtn.disabled = false; cpBtn.disabled = false;
       fabStop.style.display = 'block';
 
+      // ★ ユーザー操作直後に無音でTTSを“解錠”してから案内・初期判定
+      await primeTTSIfNeeded();
       speak('追跡を開始します。', ()=> {
         ensurePositionThenAnnounce();  // 位置取得→初期まとめ読み上げ
       });
@@ -235,11 +261,12 @@
       tracking = false;
       startBtn.disabled = false; stopBtn.disabled = true; cpBtn.disabled = true;
       fabStop.style.display = 'none';
+      await primeTTSIfNeeded();
       speak('追跡を終了しました。');
 
       document.getElementById('adv').open = true;
 
-      // ★ 終了後に保存確認 → YESならファイル名入力 → 保存
+      // 終了後に保存確認
       if (points.length) {
         const ok = window.confirm('軌跡(GPX)を保存しますか？');
         if (ok) {
@@ -262,9 +289,9 @@
       if (lastPos) map.setView([lastPos.lat, lastPos.lon]);
     });
 
-    // チェックポイント（メモ入力）
+    // チェックポイント（メモ）
     const cpLayer = L.layerGroup().addTo(map);
-    cpBtn.addEventListener('click', ()=>{
+    cpBtn.addEventListener('click', async ()=>{
       if (!lastPos) return;
       const memo = window.prompt('チェックポイントのメモ（任意）を入力');
       const p = { lat:lastPos.lat, lon:lastPos.lon, time:new Date().toISOString(), memo: memo || '' };
@@ -274,6 +301,7 @@
       }).addTo(cpLayer);
       const label = p.memo ? (`メモ: ${p.memo}`) : 'チェックポイント';
       m.bindPopup(`${label}<br>${new Date(p.time).toLocaleString()}`);
+      await primeTTSIfNeeded();
       speak('チェックポイント。');
     });
 
@@ -282,6 +310,7 @@
       const d = new Date();
       return `route_${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}.gpx`;
     }
+    function escapeXml(s){ return s.replace(/[<>&'"]/g, c=>({ '<':'&lt;','>':'&gt;','&':'&amp;','\'':'&apos;','"':'&quot;' }[c])); }
     function buildGpx(){
       // CPをwpt、走行軌跡をtrkとして出力
       const header =
@@ -299,8 +328,6 @@
         `</trkseg></trk>`;
       return header + wpts + trk + `</gpx>`;
     }
-    function escapeXml(s){ return s.replace(/[<>&'"]/g, c=>({ '<':'&lt;','>':'&gt;','&':'&amp;','\'':'&apos;','"':'&quot;' }[c])); }
-
     async function saveTextFileInteractively(defaultName, text){
       const blob = new Blob([text], {type:'application/gpx+xml'});
       if (window.showSaveFilePicker){
@@ -448,7 +475,7 @@
           }
         }
       }
-      // ファイル読込後にも初期判定（読み込み先→位置先の順でも動く）
+      // ファイル読込後にも初期判定（読み込み先→位置先でも動く）
       tryAnnounceInitialOnce();
     });
 
