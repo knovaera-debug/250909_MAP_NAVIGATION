@@ -2,16 +2,19 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <title>実車評価支援ツール（初期近傍読み上げ安定化版）</title>
+  <title>実車評価支援ツール（初期近傍読み上げ安定・終了時保存・CPメモ）</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
   <!-- Leaflet：CDN -->
   <link rel="stylesheet"
         href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
         integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
         crossorigin=""/>
+
   <style>
     html, body { height:100%; margin:0; }
-    #map { position:absolute; inset:0; min-height:60vh; }
+    #map { position:absolute; inset:0; min-height:60vh; } /* 保険で高さ確保 */
+
     #panel{
       position:absolute; top:8px; left:8px; right:8px;
       background:#fff; padding:10px; border-radius:12px;
@@ -25,6 +28,7 @@
     #fabStop{ position:absolute; bottom:20px; right:20px; border-radius:50%; width:64px; height:64px; font-size:14px; font-weight:bold; background:red; color:#fff; display:none; z-index:1200; }
     .counts{ font-size:12px; margin-left:auto; }
     .small{ font-size:12px; color:#333; }
+
     @media (max-width:480px){
       #panel{ padding:8px 10px; border-radius:10px; font-size:12px; }
       h1{ font-size:13px; }
@@ -69,7 +73,6 @@
 
       <div class="row">
         <button id="tts">音声テスト</button>
-        <select id="voiceSelect" class="small" style="min-width:200px"></select>
         <button id="wake">画面オフ防止: OFF</button>
       </div>
 
@@ -83,16 +86,13 @@
         <input id="notifyRange" type="range" min="50" max="300" step="10" value="120" style="width:180px; margin-left:8px;">
       </div>
 
-      <div class="row">
-        <input id="gpxName" type="text" placeholder="ファイル名（例: route_YYYYMMDD.gpx）" style="min-width:220px;" />
-        <button id="saveGpx" disabled>GPX保存</button>
-        <span id="stat" class="small"></span>
-      </div>
+      <!-- 保存UIは表示しない（終了時に確認して保存） -->
     </details>
   </div>
 
   <button id="fabStop">終了</button>
 
+  <!-- libs -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script src="jszip.min.js"></script>
@@ -101,12 +101,13 @@
   <script>
   document.addEventListener('DOMContentLoaded', function(){
 
-    /* === 地図 === */
+    /* ===== 地図 ===== */
     const map = L.map('map').setView([35.0, 135.0], 13);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '© OpenStreetMap contributors'
     }).addTo(map);
 
+    // 自車マーカー（赤塗り）
     const carIcon = L.divIcon({
       className: 'custom-car',
       html: '<div style="width:16px;height:16px;background:red;border-radius:50%;"></div>',
@@ -114,49 +115,25 @@
     });
     const carMarker = L.marker([35.0, 135.0], {icon:carIcon}).addTo(map);
 
-    /* === TTS（端末選択を尊重） === */
+    /* ===== TTS（iPhone側の設定に従う：UIで声選択はしない） ===== */
     const ttsRate = document.getElementById('ttsRate');
     const ttsRateVal = document.getElementById('ttsRateVal');
-    const voiceSelect = document.getElementById('voiceSelect');
-    let voicesCache = [], selectedVoice = null;
 
-    function populateVoiceSelect(){
-      voicesCache = speechSynthesis.getVoices();
-      if (!voicesCache.length) return;
-      const saved = localStorage.getItem('voiceName');
-      selectedVoice = voicesCache.find(v => v.name === saved) || voicesCache[0];
-      voiceSelect.innerHTML = '';
-      voicesCache.forEach(v=>{
-        const o=document.createElement('option');
-        o.value=v.name; o.textContent=`${v.name} (${v.lang})`;
-        if (selectedVoice && v.name===selectedVoice.name) o.selected=true;
-        voiceSelect.appendChild(o);
-      });
-    }
     function speak(text, onend){
       const u = new SpeechSynthesisUtterance(text);
-      if (!voicesCache.length) populateVoiceSelect();
-      if (selectedVoice) u.voice = selectedVoice;
-      u.rate = parseFloat(ttsRate.value || '1.0');
+      u.rate = parseFloat(ttsRate.value || '1.0');   // 速度のみUIで調整
       if (onend) u.onend = onend;
-      speechSynthesis.speak(u);
+      speechSynthesis.speak(u);                      // 声は端末デフォルト
     }
-    voiceSelect.addEventListener('change', ()=>{
-      const name = voiceSelect.value;
-      selectedVoice = (speechSynthesis.getVoices()||[]).find(v=>v.name===name) || selectedVoice;
-      localStorage.setItem('voiceName', name);
-    });
-    speechSynthesis.onvoiceschanged = populateVoiceSelect;
-    setTimeout(populateVoiceSelect, 300);
-    document.getElementById('tts').addEventListener('click', ()=>{ if (!voicesCache.length) populateVoiceSelect(); speak('音声テストです。'); });
+    document.getElementById('tts').addEventListener('click', ()=>{ speak('音声テストです。'); });
     ttsRate.addEventListener('input', ()=>{ ttsRateVal.textContent = ttsRate.value; });
 
-    /* === 追跡 === */
+    /* ===== 追跡 ===== */
     let watching = null;
     let tracking = false;
     let points = [];
-    let lastPos = null;             // ★ 直近位置
-    let initialAnnounced = false;   // ★ 初期アナウンスを一度だけにする
+    let lastPos = null;             // 直近位置
+    const cpList = [];              // チェックポイント（メモ付き）
     const poly = L.polyline([], { color:'#d00', weight:4 }).addTo(map);
 
     const startBtn = document.getElementById('start');
@@ -168,9 +145,13 @@
     const counts = document.getElementById('counts');
     function updateCounts(){ counts.textContent = `点:${points.length}`; }
 
+    // 初期まとめ読み上げ 制御（レース潰し）
+    let initialAnnounced = false;   // 一度だけ
+    let initialAnnouncing = false;  // 実行中は通常アナウンスを抑止
+
     function onLoc(pos){
       const { latitude:lat, longitude:lon } = pos.coords;
-      lastPos = {lat, lon};                   // ★ 位置更新
+      lastPos = {lat, lon};
       const now = new Date();
       carMarker.setLatLng([lat, lon]);
       if (tracking){
@@ -180,8 +161,12 @@
       }
       if (keepCentered.checked) map.setView([lat, lon]);
 
-      maybeAnnounceNearestPOI(lat, lon);     // 走行中随時
-      tryAnnounceInitialOnce();               // ★ 初期アナウンス試行（位置が来たタイミングでも）
+      // 初期まとめ読み上げが終わるまでは通常アナウンスを抑止
+      if (tracking && !initialAnnounced) {
+        tryAnnounceInitialOnce();
+      } else {
+        maybeAnnounceNearestPOI(lat, lon);
+      }
     }
     function onLocErr(err){ console.warn(err); }
 
@@ -190,9 +175,12 @@
       tracking = true;
       startBtn.disabled = true; stopBtn.disabled = false; cpBtn.disabled = false;
       fabStop.style.display = 'block';
+
+      // ユーザー操作内で必ずキュー許可されるよう、開始の一言の「後」に初期判定
       speak('追跡を開始します。', ()=> {
-        ensurePositionThenAnnounce();         // ★ 開始直後に必ず判定
+        ensurePositionThenAnnounce();  // 位置取得→初期まとめ読み上げ
       });
+
       if (!watching) {
         watching = navigator.geolocation.watchPosition(
           onLoc, onLocErr, { enableHighAccuracy:true, maximumAge:2000, timeout:10000 }
@@ -200,16 +188,32 @@
       }
       document.getElementById('adv').open = false;
     }
-    function stopTracking(){
+
+    async function stopTracking(){
       if (!tracking) return;
       tracking = false;
       startBtn.disabled = false; stopBtn.disabled = true; cpBtn.disabled = true;
       fabStop.style.display = 'none';
       speak('追跡を終了しました。');
-      document.getElementById('saveGpx').disabled = points.length === 0;
+
       document.getElementById('adv').open = true;
       updateCounts();
+
+      // ★ 終了後に保存確認 → YESならファイル名入力 → 保存
+      if (points.length) {
+        const ok = window.confirm('軌跡(GPX)を保存しますか？');
+        if (ok) {
+          let fn = prompt('保存するファイル名を入力してください（.gpxまで）', defaultGpxName());
+          if (fn) {
+            fn = fn.trim();
+            if (!fn.toLowerCase().endsWith('.gpx')) fn += '.gpx';
+            const gpx = buildGpx();
+            await saveTextFileInteractively(fn, gpx);
+          }
+        }
+      }
     }
+
     startBtn.addEventListener('click', startTracking);
     stopBtn.addEventListener('click', stopTracking);
     fabStop.addEventListener('click', stopTracking);
@@ -218,24 +222,45 @@
       if (lastPos) map.setView([lastPos.lat, lastPos.lon]);
     });
 
-    // CP
+    // チェックポイント（メモ入力）
     const cpLayer = L.layerGroup().addTo(map);
     cpBtn.addEventListener('click', ()=>{
       if (!lastPos) return;
-      L.circleMarker([lastPos.lat, lastPos.lon], { radius:6, color:'#a00', weight:2, fillColor:'#f66', fillOpacity:0.9 }).addTo(cpLayer);
+      const memo = window.prompt('チェックポイントのメモ（任意）を入力');
+      const p = { lat:lastPos.lat, lon:lastPos.lon, time:new Date().toISOString(), memo: memo || '' };
+      cpList.push(p);
+      const m = L.circleMarker([p.lat, p.lon], {
+        radius:6, color:'#a00', weight:2, fillColor:'#f66', fillOpacity:0.9
+      }).addTo(cpLayer);
+      const label = p.memo ? (`メモ: ${p.memo}`) : 'チェックポイント';
+      m.bindPopup(`${label}<br>${new Date(p.time).toLocaleString()}`);
       speak('チェックポイント。');
     });
 
-    /* === GPX 生成/保存（省略せずそのまま） === */
+    /* ===== GPX 生成 & 保存（終了時に実行） ===== */
+    function defaultGpxName(){
+      const d = new Date();
+      return `route_${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}.gpx`;
+    }
     function buildGpx(){
-      if (!points.length) return '';
+      // CPをwpt、走行軌跡をtrkとして出力
       const header =
         `<?xml version="1.0" encoding="UTF-8"?>\n`+
-        `<gpx version="1.1" creator="RouteHelper" xmlns="http://www.topografix.com/GPX/1/1">\n`+
-        `<trk><name>track</name><trkseg>`;
-      const body = points.map(p=>`<trkpt lat="${p.lat}" lon="${p.lon}"><time>${p.time}</time></trkpt>`).join('');
-      return header + body + `</trkseg></trk></gpx>`;
+        `<gpx version="1.1" creator="RouteHelper" xmlns="http://www.topografix.com/GPX/1/1">\n`;
+      const wpts = cpList.map(cp =>
+        `<wpt lat="${cp.lat}" lon="${cp.lon}">`+
+          (cp.time ? `<time>${cp.time}</time>` : '') +
+          (cp.memo ? `<name>${escapeXml(cp.memo)}</name>` : '') +
+        `</wpt>`
+      ).join('');
+      const trk =
+        `<trk><name>track</name><trkseg>`+
+        points.map(p=>`<trkpt lat="${p.lat}" lon="${p.lon}"><time>${p.time}</time></trkpt>`).join('')+
+        `</trkseg></trk>`;
+      return header + wpts + trk + `</gpx>`;
     }
+    function escapeXml(s){ return s.replace(/[<>&'"]/g, c=>({ '<':'&lt;','>':'&gt;','&':'&amp;','\'':'&apos;','"':'&quot;' }[c])); }
+
     async function saveTextFileInteractively(defaultName, text){
       const blob = new Blob([text], {type:'application/gpx+xml'});
       if (window.showSaveFilePicker){
@@ -246,35 +271,17 @@
           });
           const writable = await handle.createWritable();
           await writable.write(blob); await writable.close();
-          return {ok:true, method:'fs-access'};
-        }catch(e){}
+          alert('保存しました（指定場所）');
+          return;
+        }catch(e){ /* キャンセル等はフォールバック */ }
       }
       const a=document.createElement('a');
       a.href=URL.createObjectURL(blob); a.download=defaultName||'track.gpx';
       document.body.appendChild(a); a.click(); URL.revokeObjectURL(a.href); a.remove();
-      return {ok:true, method:'download'};
+      alert('保存しました（ダウンロード）');
     }
-    const saveBtn=document.getElementById('saveGpx');
-    const nameInput=document.getElementById('gpxName');
-    saveBtn.addEventListener('click', async ()=>{
-      const gpx=buildGpx();
-      if(!gpx){ alert('GPXデータがありません'); return; }
-      let fn=(nameInput && nameInput.value.trim())||'';
-      if(!fn){
-        const d=new Date();
-        fn=`route_${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}.gpx`;
-        if(nameInput) nameInput.value=fn;
-      }
-      if(!fn.toLowerCase().endsWith('.gpx')) fn+='.gpx';
-      const res=await saveTextFileInteractively(fn,gpx);
-      const stat=document.getElementById('stat');
-      if(stat){
-        stat.textContent=res.method==='fs-access'?'保存しました（指定場所）':'保存しました（ダウンロード）';
-        setTimeout(()=>stat.textContent='',3000);
-      }
-    });
 
-    /* === POI 読み上げ（近傍優先 & 初期まとめ読み） === */
+    /* ===== POI 読み上げ（近傍優先 & 初期まとめ読み） ===== */
     const notifyRangeInput=document.getElementById('notifyRange');
     const notifyRangeVal=document.getElementById('notifyRangeVal');
     notifyRangeInput.addEventListener('input',()=>{ notifyRangeVal.textContent=notifyRangeInput.value; });
@@ -309,9 +316,10 @@
       return 2*R*Math.asin(Math.sqrt(a));
     }
 
-    // 走行中：半径内の最寄り1件のみ（クールダウン付き）
+    // 通常走行中：半径内の最寄り1件（クールダウン）
     let lastSpeakAt=0; const MIN_SPEAK_INTERVAL_MS=5000;
     function maybeAnnounceNearestPOI(lat,lon){
+      if (initialAnnouncing) return; // 初期まとめ読み上げ中は抑止
       const range=parseFloat(notifyRangeInput.value||'120');
       const candidates=poiList
         .filter(p=>!p.notified && haversineMeters(lat,lon,p.lat,p.lon)<=range)
@@ -325,7 +333,7 @@
       nearest.notified=true; lastSpeakAt=now;
     }
 
-    // 初期：半径内の全件を近い順にまとめて読み上げ（1回だけ）
+    // 初期まとめ読み上げ：半径内の全件を近い順に（1回だけ）
     function getInRangeSorted(lat, lon){
       const range=parseFloat(notifyRangeInput.value||'120');
       return poiList
@@ -333,10 +341,9 @@
         .map(p=>({p,d:haversineMeters(lat,lon,p.lat,p.lon)}))
         .sort((a,b)=>a.d-b.d);
     }
-    function speakQueue(lines){
-      speechSynthesis.cancel(); // 念のためキューをリセット
+    function speakQueue(lines, done){
       const next = () => {
-        if (!lines.length) return;
+        if (!lines.length){ if(done) done(); return; }
         const t = lines.shift();
         speak(t, ()=> setTimeout(next, 200)); // 0.2秒間隔
       };
@@ -345,15 +352,19 @@
     function tryAnnounceInitialOnce(){
       if (initialAnnounced || !lastPos || !poiList.length) return;
       const list = getInRangeSorted(lastPos.lat, lastPos.lon);
-      if (!list.length) return;
-      initialAnnounced = true;
+      if (!list.length){ initialAnnounced = true; return; }
+      initialAnnouncing = true;
       const msgs = list.map(({p,d})=>{
         p.notified = true; // 二重読み上げ防止
         const txt=[p.title, p.memo].filter(Boolean).join('。');
         return (txt||'評価ポイント')+`。距離 ${Math.round(d)} メートル。`;
       });
-      lastSpeakAt = Date.now(); // 直後のmaybeAnnounceNearestPOIとの競合防止
-      speakQueue(msgs);
+      // まとめ読みが終わるまでは通常アナウンスを抑止 → 完了後に解放
+      speakQueue(msgs, ()=>{
+        initialAnnouncing = false;
+        initialAnnounced  = true;
+        lastSpeakAt = Date.now(); // 直後の通常読み上げとの競合防止
+      });
     }
     function ensurePositionThenAnnounce(){
       if (lastPos){ tryAnnounceInitialOnce(); return; }
@@ -365,11 +376,11 @@
       }
     }
 
-    /* === KML/KMZ 読み込み & セレクト === */
+    /* ===== KML/KMZ 読み込み & セレクト ===== */
     const fileInput=document.getElementById('file');
     const datasetSelect=document.getElementById('datasetSelect');
     const placeholderOpt = datasetSelect.querySelector('option[value=""]');
-    const datasetsByValue = new Map();
+    const datasetsByValue = new Map(); // value -> {name, layer}
 
     function activateDatasetSelect(){
       if (placeholderOpt){ placeholderOpt.disabled = true; placeholderOpt.selected = false; }
@@ -398,7 +409,7 @@
           }
         }
       }
-      // ファイル読込後にも試行（ファイル先・位置後のどちらでも動くように）
+      // ファイル読込後にも初期判定（読み込み先→位置先の順でも動く）
       tryAnnounceInitialOnce();
     });
 
@@ -421,7 +432,7 @@
       activateDatasetSelect();
       collectPOIsFromGeoJSON(gj);
 
-      // 追加直後にも試行（位置が既に来ていれば即アナウンス）
+      // 追加直後にも初期判定（位置が既に来ていれば即アナウンス）
       tryAnnounceInitialOnce();
     }
 
@@ -432,7 +443,7 @@
       });
     });
 
-    /* === 画面オフ防止 === */
+    /* ===== 画面オフ防止 ===== */
     const wakeBtn=document.getElementById('wake'); let wakeLock=null;
     async function toggleWake(){
       if(!wakeLock){
@@ -454,7 +465,6 @@
     }
 
     // 初期状態
-    document.getElementById('saveGpx').disabled = true;
     updateCounts();
 
   }); // DOMContentLoaded
