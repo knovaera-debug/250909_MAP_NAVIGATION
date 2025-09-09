@@ -2,18 +2,14 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <title>実車評価支援ツール（iOS無音解錠TTS・初期近傍読み上げ・終了時保存・CPメモ・速度/距離）</title>
+  <title>実車評価支援ツール（初期近傍読み上げ確実化・終了時保存・CPメモ・速度/距離）</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
-  <!-- Leaflet：CDN -->
   <link rel="stylesheet"
         href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-        crossorigin=""/>
-
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
   <style>
     html, body { height:100%; margin:0; }
-    #map { position:absolute; inset:0; min-height:60vh; } /* 保険で高さ確保 */
+    #map { position:absolute; inset:0; min-height:60vh; }
 
     #panel{
       position:absolute; top:8px; left:8px; right:8px;
@@ -61,7 +57,7 @@
       <span id="counts" class="counts"></span>
     </div>
 
-    <!-- 速度/距離のHUD -->
+    <!-- 速度/距離 HUD -->
     <div class="row small" id="hud" style="align-items:baseline;">
       <span>速度: <strong><span id="hudSpeed">0.0</span> km/h</strong></span>
       <span style="margin-left:12px;">距離: <strong><span id="hudDist">0.000</span> km</strong></span>
@@ -96,7 +92,6 @@
 
   <button id="fabStop">終了</button>
 
-  <!-- libs -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script src="jszip.min.js"></script>
@@ -119,7 +114,7 @@
     });
     const carMarker = L.marker([35.0, 135.0], {icon:carIcon}).addTo(map);
 
-    /* ===== TTS（iOS対策：無音で“解錠”してから話す） ===== */
+    /* ===== TTS（iOS対策：解錠→発話） ===== */
     const ttsRate = document.getElementById('ttsRate');
     const ttsRateVal = document.getElementById('ttsRateVal');
     let ttsPrimed = false;
@@ -128,59 +123,46 @@
       if (ttsPrimed) return Promise.resolve();
       return new Promise(resolve=>{
         try{ speechSynthesis.cancel(); speechSynthesis.resume(); }catch(e){}
-        const u = new SpeechSynthesisUtterance('\u00A0'); // NBSP（無音）
-        u.lang = 'ja-JP';
-        u.volume = 0;           // 無音で実行→iOSの初回ブロックを解除
-        u.rate = 1;
-        u.onend = ()=>{ ttsPrimed = true; resolve(); };
-        // 念のためタイムアウトで解決
-        const timer = setTimeout(()=>{ ttsPrimed = true; resolve(); }, 1200);
+        // 一部iOSでは「完全な無音」は解錠にならないため、極小音量の短文を発話
+        const u = new SpeechSynthesisUtterance('準備します');
+        u.lang = 'ja-JP'; u.volume = 0.01; u.rate = 1;
+        const timer = setTimeout(()=>{ ttsPrimed = true; resolve(); }, 1500);
         u.onend = ()=>{ clearTimeout(timer); ttsPrimed = true; resolve(); };
         speechSynthesis.speak(u);
       });
     }
-    function speak(text, onend){
-      const u = new SpeechSynthesisUtterance(text);
-      u.lang = 'ja-JP'; // 端末の日本語音声を使う
-      u.rate = parseFloat(ttsRate.value || '1.0');
-      if (onend) u.onend = onend;
-      speechSynthesis.speak(u);
+    function speakAsync(text){
+      return primeTTSIfNeeded().then(()=> new Promise(res=>{
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = 'ja-JP';
+        u.rate = parseFloat(ttsRate.value || '1.0');
+        u.onend = res;
+        speechSynthesis.speak(u);
+      }));
     }
     document.getElementById('tts').addEventListener('click', async ()=>{
-      await primeTTSIfNeeded();
-      speak('音声テストです。');
+      await speakAsync('音声テストです。');
     });
     ttsRate.addEventListener('input', ()=>{ ttsRateVal.textContent = ttsRate.value; });
-
-    // ページ復帰で音声が止まりっぱなしを避ける
-    document.addEventListener('visibilitychange', ()=>{
-      if (document.visibilityState === 'visible'){
-        try{ speechSynthesis.resume(); }catch(e){}
-      }
-    });
+    document.addEventListener('visibilitychange', ()=>{ if (document.visibilityState==='visible') { try{ speechSynthesis.resume(); }catch(e){} }});
 
     /* ===== 追跡 ===== */
     let watching = null;
     let tracking = false;
     let points = [];
-    let lastPos = null;                     // 直近位置
-    const cpList = [];                      // チェックポイント（メモ付き）
+    let lastPos = null;                // 直近位置
+    const cpList = [];                 // チェックポイント（メモ付き）
     const poly = L.polyline([], { color:'#d00', weight:4 }).addTo(map);
 
     // 速度/距離
     let totalDistM = 0;
-    let lastTrackPoint = null;              // {lat, lon, t}
+    let lastTrackPoint = null;         // {lat, lon, t}
     let lastSpeedMps = 0;
     const hudSpeed = document.getElementById('hudSpeed');
     const hudDist  = document.getElementById('hudDist');
     function fmt(n, d){ return (isFinite(n)? n : 0).toFixed(d); }
-    function updateHUD(){
-      if (hudSpeed) hudSpeed.textContent = fmt(lastSpeedMps * 3.6, 1);
-      if (hudDist)  hudDist.textContent  = fmt(totalDistM / 1000, 3);
-    }
-    function resetTripStats(){
-      totalDistM = 0; lastTrackPoint = null; lastSpeedMps = 0; updateHUD();
-    }
+    function updateHUD(){ hudSpeed.textContent = fmt(lastSpeedMps*3.6,1); hudDist.textContent = fmt(totalDistM/1000,3); }
+    function resetTripStats(){ totalDistM=0; lastTrackPoint=null; lastSpeedMps=0; updateHUD(); }
 
     const startBtn = document.getElementById('start');
     const stopBtn  = document.getElementById('stop');
@@ -192,8 +174,7 @@
     function updateCounts(){ counts.textContent = `点:${points.length}`; }
 
     // 初期まとめ読み上げ 制御
-    let initialAnnounced = false;   // 一度だけ
-    let initialAnnouncing = false;  // 実行中は通常アナウンス抑止
+    let initialAnnounced = false; // ★「実際に発話できたら」だけ true にする
 
     function onLoc(pos){
       const { latitude:lat, longitude:lon, speed } = pos.coords;
@@ -207,15 +188,13 @@
           const d = haversineMeters(lat, lon, lastTrackPoint.lat, lastTrackPoint.lon);
           const dt = Math.max(0.001, (now - lastTrackPoint.t) / 1000);
           totalDistM += d;
-          const sp = (typeof speed === 'number' && isFinite(speed) && speed >= 0) ? speed : (d / dt);
-          lastSpeedMps = sp;
+          lastSpeedMps = (typeof speed === 'number' && isFinite(speed) && speed >= 0) ? speed : (d/dt);
         } else {
           lastSpeedMps = (typeof speed === 'number' && isFinite(speed) && speed >= 0) ? speed : 0;
         }
         lastTrackPoint = { lat, lon, t: now };
         updateHUD();
 
-        // トラック
         points.push({lat, lon, time: new Date(now).toISOString()});
         poly.addLatLng([lat, lon]);
         updateCounts();
@@ -223,11 +202,11 @@
 
       if (keepCentered.checked) map.setView([lat, lon]);
 
-      // 初期まとめ読み上げが終わるまでは通常アナウンス抑止
+      // 初期アナウンスがまだなら常に試行（候補0のときはスルー。フラグは倒さない）
       if (tracking && !initialAnnounced) {
-        tryAnnounceInitialOnce();
-      } else {
-        maybeAnnounceNearestPOI(lat, lon);
+        tryAnnounceInitial(); // 条件が揃ったタイミングで確実に発話
+      } else if (tracking) {
+        maybeAnnounceNearestPOI(lat, lon); // 通常運転
       }
     }
     function onLocErr(err){ console.warn(err); }
@@ -236,17 +215,13 @@
       if (tracking) return;
       tracking = true;
       resetTripStats();
-      points = [];
-      updateCounts();
+      points = []; updateCounts();
 
       startBtn.disabled = true; stopBtn.disabled = false; cpBtn.disabled = false;
       fabStop.style.display = 'block';
 
-      // ★ ユーザー操作直後に無音でTTSを“解錠”してから案内・初期判定
-      await primeTTSIfNeeded();
-      speak('追跡を開始します。', ()=> {
-        ensurePositionThenAnnounce();  // 位置取得→初期まとめ読み上げ
-      });
+      await speakAsync('追跡を開始します。');
+      ensurePositionThenAnnounce();  // 位置がまだ無ければ1回取得→初期発話を試行
 
       if (!watching) {
         watching = navigator.geolocation.watchPosition(
@@ -261,8 +236,7 @@
       tracking = false;
       startBtn.disabled = false; stopBtn.disabled = true; cpBtn.disabled = true;
       fabStop.style.display = 'none';
-      await primeTTSIfNeeded();
-      speak('追跡を終了しました。');
+      await speakAsync('追跡を終了しました。');
 
       document.getElementById('adv').open = true;
 
@@ -279,15 +253,15 @@
           }
         }
       }
+      // 次回のために初期アナウンス状態をリセット
+      initialAnnounced = false;
     }
 
     startBtn.addEventListener('click', startTracking);
     stopBtn.addEventListener('click', stopTracking);
     fabStop.addEventListener('click', stopTracking);
 
-    recenterBtn.addEventListener('click', ()=>{
-      if (lastPos) map.setView([lastPos.lat, lastPos.lon]);
-    });
+    recenterBtn.addEventListener('click', ()=>{ if (lastPos) map.setView([lastPos.lat, lastPos.lon]); });
 
     // チェックポイント（メモ）
     const cpLayer = L.layerGroup().addTo(map);
@@ -301,8 +275,7 @@
       }).addTo(cpLayer);
       const label = p.memo ? (`メモ: ${p.memo}`) : 'チェックポイント';
       m.bindPopup(`${label}<br>${new Date(p.time).toLocaleString()}`);
-      await primeTTSIfNeeded();
-      speak('チェックポイント。');
+      await speakAsync('チェックポイント。');
     });
 
     /* ===== GPX 生成 & 保存（終了時に実行） ===== */
@@ -312,7 +285,6 @@
     }
     function escapeXml(s){ return s.replace(/[<>&'"]/g, c=>({ '<':'&lt;','>':'&gt;','&':'&amp;','\'':'&apos;','"':'&quot;' }[c])); }
     function buildGpx(){
-      // CPをwpt、走行軌跡をtrkとして出力
       const header =
         `<?xml version="1.0" encoding="UTF-8"?>\n`+
         `<gpx version="1.1" creator="RouteHelper" xmlns="http://www.topografix.com/GPX/1/1">\n`;
@@ -385,8 +357,8 @@
 
     // 通常走行中：半径内の最寄り1件（クールダウン）
     let lastSpeakAt=0; const MIN_SPEAK_INTERVAL_MS=5000;
-    function maybeAnnounceNearestPOI(lat,lon){
-      if (initialAnnouncing) return; // 初期まとめ読み上げ中は抑止
+    async function maybeAnnounceNearestPOI(lat,lon){
+      if (!initialAnnounced) return; // 初期まとめ前は抑止
       const range=parseFloat(notifyRangeInput.value||'120');
       const candidates=poiList
         .filter(p=>!p.notified && haversineMeters(lat,lon,p.lat,p.lon)<=range)
@@ -395,12 +367,12 @@
       if(!candidates.length) return;
       const now=Date.now(); if(now-lastSpeakAt<MIN_SPEAK_INTERVAL_MS) return;
       const nearest=candidates[0].p; const d=Math.round(candidates[0].d);
-      const text=[nearest.title, nearest.memo].filter(Boolean).join('。');
-      speak((text||'評価ポイント')+`。距離 ${d} メートル。`);
-      nearest.notified=true; lastSpeakAt=now;
+      const text=[nearest.title, nearest.memo].filter(Boolean).join('。') || '評価ポイント';
+      await speakAsync(`${text}。距離 ${d} メートル。`);
+      nearest.notified=true; lastSpeakAt=Date.now();
     }
 
-    // 初期まとめ読み上げ：半径内の全件を近い順に（1回だけ）
+    // 初期まとめ読み上げ：半径内の全件を近い順に（※実際に読んだら初期済みに）
     function getInRangeSorted(lat, lon){
       const range=parseFloat(notifyRangeInput.value||'120');
       return poiList
@@ -408,37 +380,26 @@
         .map(p=>({p,d:haversineMeters(lat,lon,p.lat,p.lon)}))
         .sort((a,b)=>a.d-b.d);
     }
-    function speakQueue(lines, done){
-      const next = () => {
-        if (!lines.length){ if(done) done(); return; }
-        const t = lines.shift();
-        speak(t, ()=> setTimeout(next, 200)); // 0.2秒間隔
-      };
-      next();
-    }
-    function tryAnnounceInitialOnce(){
-      if (initialAnnounced || !lastPos || !poiList.length) return;
+    async function tryAnnounceInitial(){
+      if (initialAnnounced || !tracking || !lastPos || !poiList.length) return;
       const list = getInRangeSorted(lastPos.lat, lastPos.lon);
-      if (!list.length){ initialAnnounced = true; return; }
-      initialAnnouncing = true;
-      const msgs = list.map(({p,d})=>{
-        p.notified = true; // 二重読み上げ防止
-        const txt=[p.title, p.memo].filter(Boolean).join('。');
-        return (txt||'評価ポイント')+`。距離 ${Math.round(d)} メートル。`;
-      });
-      speakQueue(msgs, ()=>{
-        initialAnnouncing = false;
-        initialAnnounced  = true;
-        lastSpeakAt = Date.now(); // 直後の通常読み上げとの競合防止
-      });
+      if (!list.length) return; // ★ フラグは倒さない：あとで候補ができたら再試行する
+      // 読む → 読めたら初期済みにする
+      for (const {p,d} of list){
+        p.notified = true; // 重複防止
+        const text = [p.title, p.memo].filter(Boolean).join('。') || '評価ポイント';
+        await speakAsync(`${text}。距離 ${Math.round(d)} メートル。`);
+      }
+      initialAnnounced = true;
+      lastSpeakAt = Date.now();
     }
     function ensurePositionThenAnnounce(){
-      if (lastPos){ tryAnnounceInitialOnce(); return; }
+      if (lastPos){ tryAnnounceInitial(); return; }
       if (navigator.geolocation?.getCurrentPosition){
         navigator.geolocation.getCurrentPosition(p=>{
           lastPos = { lat:p.coords.latitude, lon:p.coords.longitude };
-          tryAnnounceInitialOnce();
-        }, ()=>{/* ignore */}, { enableHighAccuracy:true, timeout:5000 });
+          tryAnnounceInitial();
+        }, ()=>{}, { enableHighAccuracy:true, timeout:5000 });
       }
     }
 
@@ -446,7 +407,7 @@
     const fileInput=document.getElementById('file');
     const datasetSelect=document.getElementById('datasetSelect');
     const placeholderOpt = datasetSelect.querySelector('option[value=""]');
-    const datasetsByValue = new Map(); // value -> {name, layer}
+    const datasetsByValue = new Map();
 
     function activateDatasetSelect(){
       if (placeholderOpt){ placeholderOpt.disabled = true; placeholderOpt.selected = false; }
@@ -475,8 +436,8 @@
           }
         }
       }
-      // ファイル読込後にも初期判定（読み込み先→位置先でも動く）
-      tryAnnounceInitialOnce();
+      // ファイル読込後にも初期判定を試行（ここでもフラグは倒さない）
+      tryAnnounceInitial();
     });
 
     function addDataset(name, gj){
@@ -498,8 +459,7 @@
       activateDatasetSelect();
       collectPOIsFromGeoJSON(gj);
 
-      // 追加直後にも初期判定（位置が既に来ていれば即アナウンス）
-      tryAnnounceInitialOnce();
+      tryAnnounceInitial(); // 位置が既にあれば即発話
     }
 
     datasetSelect.addEventListener('change', ()=>{
@@ -522,11 +482,11 @@
     }
     wakeBtn.addEventListener('click', toggleWake);
 
-    // 起動時に1回だけ現在地を先取り（許可応答が遅い端末対策）
+    // 起動時：現在地を先取り（許可後に初期発話を試行）
     if (navigator.geolocation?.getCurrentPosition){
       navigator.geolocation.getCurrentPosition(p=>{
         lastPos = { lat:p.coords.latitude, lon:p.coords.longitude };
-        tryAnnounceInitialOnce();
+        tryAnnounceInitial();
       }, ()=>{}, { enableHighAccuracy:true, timeout:5000 });
     }
 
