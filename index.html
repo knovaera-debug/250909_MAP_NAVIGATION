@@ -2,10 +2,10 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <title>実車評価支援ツール（修正版：選択可/地図安定/最近傍読み上げ/GPX保存）</title>
+  <title>実車評価支援ツール（初期近傍順読み上げ対応）</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-  <!-- Leaflet：CDN から読込（404/キャッシュ不整合の回避） -->
+  <!-- Leaflet：CDN -->
   <link rel="stylesheet"
         href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
         integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
@@ -13,10 +13,8 @@
 
   <style>
     html, body { height:100%; margin:0; }
-    #map {
-      position:absolute; top:0; bottom:0; right:0; left:0;
-      min-height:60vh; /* CSS失敗時の保険 */
-    }
+    #map { position:absolute; inset:0; min-height:60vh; } /* 保険で高さ確保 */
+
     #panel{
       position:absolute; top:8px; left:8px; right:8px;
       background:#fff; padding:10px; border-radius:12px;
@@ -75,6 +73,7 @@
 
       <div class="row">
         <button id="tts">音声テスト</button>
+        <!-- 端末側（iPhone等）で好きな声を選べるよう、強制はしない -->
         <select id="voiceSelect" class="small" style="min-width:200px"></select>
         <button id="wake">画面オフ防止: OFF</button>
       </div>
@@ -99,17 +98,16 @@
 
   <button id="fabStop">終了</button>
 
-  <!-- Leaflet 本体（CDN） -->
+  <!-- libs -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <!-- 既存ファイル -->
   <script src="jszip.min.js"></script>
   <script src="togeojson.umd.js"></script>
 
   <script>
   document.addEventListener('DOMContentLoaded', function(){
 
-    /* ===== 地図初期化 ===== */
+    /* ===== 地図 ===== */
     const map = L.map('map').setView([35.0, 135.0], 13);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '© OpenStreetMap contributors'
@@ -123,41 +121,37 @@
     });
     const carMarker = L.marker([35.0, 135.0], {icon:carIcon}).addTo(map);
 
-    /* ===== TTS（端末選択を尊重） ===== */
+    /* ===== TTS ===== */
     const ttsRate = document.getElementById('ttsRate');
     const ttsRateVal = document.getElementById('ttsRateVal');
     const voiceSelect = document.getElementById('voiceSelect');
 
     let voicesCache = [];
     let selectedVoice = null;
-
     function populateVoiceSelect(){
-      voicesCache = window.speechSynthesis.getVoices();
+      voicesCache = speechSynthesis.getVoices();
       if (!voicesCache.length) return;
-      const ordered = voicesCache;
       const saved = localStorage.getItem('voiceName');
-      selectedVoice = ordered.find(v => v.name === saved) || ordered[0];
-      if (voiceSelect){
-        voiceSelect.innerHTML = '';
-        ordered.forEach(v => {
-          const opt = document.createElement('option');
-          opt.value = v.name;
-          opt.textContent = `${v.name} (${v.lang})`;
-          if (selectedVoice && v.name === selectedVoice.name) opt.selected = true;
-          voiceSelect.appendChild(opt);
-        });
-      }
+      selectedVoice = voicesCache.find(v => v.name === saved) || voicesCache[0];
+      voiceSelect.innerHTML = '';
+      voicesCache.forEach(v=>{
+        const o=document.createElement('option');
+        o.value=v.name; o.textContent=`${v.name} (${v.lang})`;
+        if (selectedVoice && v.name===selectedVoice.name) o.selected=true;
+        voiceSelect.appendChild(o);
+      });
     }
-    function speak(text){
+    function speak(text, onend){
       const u = new SpeechSynthesisUtterance(text);
       if (!voicesCache.length) populateVoiceSelect();
       if (selectedVoice) u.voice = selectedVoice;
       u.rate = parseFloat(ttsRate.value || '1.0');
+      if (onend) u.onend = onend;
       speechSynthesis.speak(u);
     }
     voiceSelect.addEventListener('change', ()=>{
       const name = voiceSelect.value;
-      selectedVoice = (speechSynthesis.getVoices() || []).find(v => v.name === name) || selectedVoice;
+      selectedVoice = (speechSynthesis.getVoices()||[]).find(v=>v.name===name) || selectedVoice;
       localStorage.setItem('voiceName', name);
     });
     speechSynthesis.onvoiceschanged = populateVoiceSelect;
@@ -169,6 +163,7 @@
     let watching = null;
     let tracking = false;
     let points = [];
+    let lastPos = null;                    // ★ 直近位置
     const poly = L.polyline([], { color:'#d00', weight:4 }).addTo(map);
 
     const startBtn = document.getElementById('start');
@@ -182,6 +177,7 @@
 
     function onLoc(pos){
       const { latitude:lat, longitude:lon } = pos.coords;
+      lastPos = {lat, lon};                // ★ 更新
       const now = new Date();
       carMarker.setLatLng([lat, lon]);
       if (tracking){
@@ -190,7 +186,7 @@
         updateCounts();
       }
       if (keepCentered.checked) map.setView([lat, lon]);
-      maybeAnnounceNearestPOI(lat, lon);
+      maybeAnnounceNearestPOI(lat, lon);   // 走行中は最寄りを都度読む
     }
     function onLocErr(err){ console.warn(err); }
 
@@ -199,7 +195,10 @@
       tracking = true;
       startBtn.disabled = true; stopBtn.disabled = false; cpBtn.disabled = false;
       fabStop.style.display = 'block';
-      speak('追跡を開始します。');
+      speak('追跡を開始します。', ()=> {
+        // 初期に半径内に既にあるポイントを、近い順でまとめて読み上げ
+        announceInitialPOIsInRange();
+      });
       if (!watching) watching = navigator.geolocation.watchPosition(onLoc, onLocErr, { enableHighAccuracy:true, maximumAge:2000, timeout:10000 });
       document.getElementById('adv').open = false;
     }
@@ -218,18 +217,14 @@
     fabStop.addEventListener('click', stopTracking);
 
     recenterBtn.addEventListener('click', ()=>{
-      if (points.length){
-        const p = points[points.length-1];
-        map.setView([p.lat, p.lon]);
-      }
+      if (lastPos) map.setView([lastPos.lat, lastPos.lon]);
     });
 
     // チェックポイント
     const cpLayer = L.layerGroup().addTo(map);
     cpBtn.addEventListener('click', ()=>{
-      if (!points.length) return;
-      const p = points[points.length-1];
-      L.circleMarker([p.lat, p.lon], { radius:6, color:'#a00', weight:2, fillColor:'#f66', fillOpacity:0.9 }).addTo(cpLayer);
+      if (!lastPos) return;
+      L.circleMarker([lastPos.lat, lastPos.lon], { radius:6, color:'#a00', weight:2, fillColor:'#f66', fillOpacity:0.9 }).addTo(cpLayer);
       speak('チェックポイント。');
     });
 
@@ -281,7 +276,7 @@
       }
     });
 
-    /* ===== POI（タイトル＋メモ）読み上げ：最近傍優先 ===== */
+    /* ===== POI 読み上げ（タイトル＋メモ） ===== */
     const notifyRangeInput=document.getElementById('notifyRange');
     const notifyRangeVal=document.getElementById('notifyRangeVal');
     notifyRangeInput.addEventListener('input',()=>{ notifyRangeVal.textContent=notifyRangeInput.value; });
@@ -315,6 +310,8 @@
       const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
       return 2*R*Math.asin(Math.sqrt(a));
     }
+
+    // 走行中の単発アナウンス（最寄り1件）
     let lastSpeakAt=0; const MIN_SPEAK_INTERVAL_MS=5000;
     function maybeAnnounceNearestPOI(lat,lon){
       const range=parseFloat(notifyRangeInput.value||'120');
@@ -330,7 +327,36 @@
       nearest.notified=true; lastSpeakAt=now;
     }
 
-    /* ===== KML/KMZ 読み込み & セレクト操作 ===== */
+    // ★ 初期に半径内へ既に入っているものを「近い順に全部」読む
+    function getInRangeSorted(lat, lon){
+      const range=parseFloat(notifyRangeInput.value||'120');
+      return poiList
+        .filter(p=>!p.notified && haversineMeters(lat,lon,p.lat,p.lon)<=range)
+        .map(p=>({p,d:haversineMeters(lat,lon,p.lat,p.lon)}))
+        .sort((a,b)=>a.d-b.d);
+    }
+    function speakQueue(texts){
+      const next = () => {
+        if (!texts.length) return;
+        const t = texts.shift();
+        speak(t, () => setTimeout(next, 250)); // 0.25秒間隔で次へ
+      };
+      next();
+    }
+    function announceInitialPOIsInRange(){
+      if (!lastPos) return;
+      const list = getInRangeSorted(lastPos.lat, lastPos.lon);
+      if (!list.length) return;
+      const msgs = list.map(({p,d})=>{
+        p.notified = true; // 重複防止
+        const txt=[p.title, p.memo].filter(Boolean).join('。');
+        return (txt||'評価ポイント')+`。距離 ${Math.round(d)} メートル。`;
+      });
+      lastSpeakAt = Date.now(); // 直後の二重読み上げを防止
+      speakQueue(msgs);
+    }
+
+    /* ===== KML/KMZ 読み込み & セレクト ===== */
     const fileInput=document.getElementById('file');
     const datasetSelect=document.getElementById('datasetSelect');
     const placeholderOpt = datasetSelect.querySelector('option[value=""]');
@@ -339,7 +365,7 @@
     function activateDatasetSelect(){
       if (placeholderOpt){ placeholderOpt.disabled = true; placeholderOpt.selected = false; }
       if (datasetSelect.options.length > 1 && datasetSelect.selectedIndex === 0){
-        datasetSelect.selectedIndex = 1; // 最初の実データを選択
+        datasetSelect.selectedIndex = 1;
         datasetSelect.dispatchEvent(new Event('change'));
       }
     }
@@ -363,6 +389,8 @@
           }
         }
       }
+      // ファイル読込直後にも（初期判定）
+      announceInitialPOIsInRange();
     });
 
     function addDataset(name, gj){
@@ -375,23 +403,19 @@
         map.fitBounds(layer.getBounds(), {padding:[20,20]});
       }
 
-      // セレクトに項目を追加（value は一意）
+      // セレクトへ（value は一意）
       const value = `${name}__${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
       const opt=document.createElement('option');
       opt.value=value; opt.textContent=name;
       datasetSelect.appendChild(opt);
       datasetsByValue.set(value, {name, layer});
 
-      // プレースホルダーを無効化し、選択可能に
       activateDatasetSelect();
-
-      // 読み上げ用 POI 取り込み
       collectPOIsFromGeoJSON(gj);
     }
 
     datasetSelect.addEventListener('change', ()=>{
       const selValue = datasetSelect.value;
-      // すべて薄め、選択したものを強調
       datasetsByValue.forEach(({layer}, v)=>{
         if (layer.setStyle) layer.setStyle({opacity: v===selValue ? 1 : 0.35});
       });
@@ -413,6 +437,13 @@
     // 初期状態
     document.getElementById('saveGpx').disabled = true;
     updateCounts();
+
+    // 起動時に1回だけ現在地を取得して lastPos を先に持っておく（任意）
+    if (navigator.geolocation?.getCurrentPosition){
+      navigator.geolocation.getCurrentPosition(p=>{
+        lastPos = { lat:p.coords.latitude, lon:p.coords.longitude };
+      }, ()=>{}, { enableHighAccuracy:true, timeout:5000 });
+    }
 
   }); // DOMContentLoaded
   </script>
