@@ -2,11 +2,14 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <title>実車評価支援ツール（初期近傍読み上げ確実化・終了時保存・CPメモ・速度/距離）</title>
+  <title>実車評価支援ツール（開始直後アナウンス確実化）</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!-- Leaflet（CDN） -->
   <link rel="stylesheet"
         href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
         integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+
   <style>
     html, body { height:100%; margin:0; }
     #map { position:absolute; inset:0; min-height:60vh; }
@@ -31,7 +34,6 @@
       button{ padding:6px 8px; min-height:32px; font-size:12px; }
       .row{ gap:6px; }
       .row.row-actions{ display:grid; grid-template-columns:1fr 1fr; gap:6px; }
-      #fname{ display:none; }
     }
   </style>
 </head>
@@ -46,7 +48,6 @@
       <select id="datasetSelect" class="grow">
         <option value="" disabled selected>（読み込んだルート／ポイントを選択）</option>
       </select>
-      <span id="fname" class="small"></span>
     </div>
 
     <div class="row row-actions">
@@ -92,6 +93,7 @@
 
   <button id="fabStop">終了</button>
 
+  <!-- libs -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script src="jszip.min.js"></script>
@@ -123,7 +125,7 @@
       if (ttsPrimed) return Promise.resolve();
       return new Promise(resolve=>{
         try{ speechSynthesis.cancel(); speechSynthesis.resume(); }catch(e){}
-        // 一部iOSでは「完全な無音」は解錠にならないため、極小音量の短文を発話
+        // iOS は完全無音だと解錠にならないことがある → 小音量で短く話す
         const u = new SpeechSynthesisUtterance('準備します');
         u.lang = 'ja-JP'; u.volume = 0.01; u.rate = 1;
         const timer = setTimeout(()=>{ ttsPrimed = true; resolve(); }, 1500);
@@ -140,23 +142,21 @@
         speechSynthesis.speak(u);
       }));
     }
-    document.getElementById('tts').addEventListener('click', async ()=>{
-      await speakAsync('音声テストです。');
-    });
+    document.getElementById('tts').addEventListener('click', async ()=>{ await speakAsync('音声テストです。'); });
     ttsRate.addEventListener('input', ()=>{ ttsRateVal.textContent = ttsRate.value; });
     document.addEventListener('visibilitychange', ()=>{ if (document.visibilityState==='visible') { try{ speechSynthesis.resume(); }catch(e){} }});
 
-    /* ===== 追跡 ===== */
+    /* ===== 状態 ===== */
     let watching = null;
     let tracking = false;
-    let points = [];
-    let lastPos = null;                // 直近位置
-    const cpList = [];                 // チェックポイント（メモ付き）
+    let lastPos = null;                 // 直近位置
+    let points = [];                    // 走行軌跡（trk）
+    const cpList = [];                  // チェックポイント（wpt）
     const poly = L.polyline([], { color:'#d00', weight:4 }).addTo(map);
 
     // 速度/距離
     let totalDistM = 0;
-    let lastTrackPoint = null;         // {lat, lon, t}
+    let lastTrackPoint = null;          // {lat, lon, t}
     let lastSpeedMps = 0;
     const hudSpeed = document.getElementById('hudSpeed');
     const hudDist  = document.getElementById('hudDist');
@@ -173,9 +173,77 @@
     const counts = document.getElementById('counts');
     function updateCounts(){ counts.textContent = `点:${points.length}`; }
 
-    // 初期まとめ読み上げ 制御
-    let initialAnnounced = false; // ★「実際に発話できたら」だけ true にする
+    /* ===== POI 読み上げ ===== */
+    const notifyRangeInput=document.getElementById('notifyRange');
+    const notifyRangeVal=document.getElementById('notifyRangeVal');
+    notifyRangeInput.addEventListener('input',()=>{ notifyRangeVal.textContent=notifyRangeInput.value; });
+    notifyRangeVal.textContent = notifyRangeInput.value;
 
+    const poiList=[]; // {lat,lon,title,memo,notified}
+    function htmlToPlain(html){
+      if(!html) return '';
+      const el=document.createElement('div'); el.innerHTML=html;
+      return (el.textContent||el.innerText||'').replace(/\s+/g,' ').trim();
+    }
+    function collectPOIsFromGeoJSON(gj){
+      (gj.features||[]).forEach(f=>{
+        if(!f||!f.geometry) return;
+        const props=f.properties||{};
+        if(f.geometry.type==='Point'){
+          const [lon,lat]=f.geometry.coordinates;
+          poiList.push({lat,lon,title:props.name||props.Title||'', memo:htmlToPlain(props.description||props.Description), notified:false});
+        } else if (f.geometry.type==='GeometryCollection' && Array.isArray(f.geometry.geometries)){
+          f.geometry.geometries.forEach(g=>{
+            if(g.type==='Point'){
+              const [lon,lat]=g.coordinates;
+              poiList.push({lat,lon,title:props.name||props.Title||'', memo:htmlToPlain(props.description||props.Description), notified:false});
+            }
+          });
+        }
+      });
+    }
+    function haversineMeters(lat1,lon1,lat2,lon2){
+      const R=6371000,toRad=x=>x*Math.PI/180;
+      const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+      const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+      return 2*R*Math.asin(Math.sqrt(a));
+    }
+    function inRangeSorted(lat, lon){
+      const range=parseFloat(notifyRangeInput.value||'120');
+      return poiList
+        .filter(p=>!p.notified && haversineMeters(lat,lon,p.lat,p.lon)<=range)
+        .map(p=>({p,d:haversineMeters(lat,lon,p.lat,p.lon)}))
+        .sort((a,b)=>a.d-b.d);
+    }
+
+    // 走行中：半径内の最寄り1件（クールダウン）
+    let lastSpeakAt=0; const MIN_SPEAK_INTERVAL_MS=5000;
+    async function maybeAnnounceNearestPOI(lat,lon){
+      const cands=inRangeSorted(lat,lon);
+      if(!cands.length) return;
+      const now=Date.now(); if(now-lastSpeakAt<MIN_SPEAK_INTERVAL_MS) return;
+      const nearest=cands[0];
+      const text=[nearest.p.title, nearest.p.memo].filter(Boolean).join('。') || '評価ポイント';
+      await speakAsync(`${text}。距離 ${Math.round(nearest.d)} メートル。`);
+      nearest.p.notified=true; lastSpeakAt=Date.now();
+    }
+
+    // 初期まとめ読み上げ（近い順に全部）。実際に読めたら完了扱い。
+    let initialAnnounced=false;
+    async function announceInitialIfAny(){
+      if(!tracking || !lastPos || !poiList.length || initialAnnounced) return;
+      const list=inRangeSorted(lastPos.lat,lastPos.lon);
+      if(!list.length) return; // 読めなかったら完了にしない（あとで再試行）
+      for(const {p,d} of list){
+        p.notified=true;
+        const text=[p.title,p.memo].filter(Boolean).join('。')||'評価ポイント';
+        await speakAsync(`${text}。距離 ${Math.round(d)} メートル。`);
+      }
+      initialAnnounced=true;
+      lastSpeakAt=Date.now();
+    }
+
+    /* ===== 測位 ===== */
     function onLoc(pos){
       const { latitude:lat, longitude:lon, speed } = pos.coords;
       const now = Date.now();
@@ -195,6 +263,7 @@
         lastTrackPoint = { lat, lon, t: now };
         updateHUD();
 
+        // 軌跡
         points.push({lat, lon, time: new Date(now).toISOString()});
         poly.addLatLng([lat, lon]);
         updateCounts();
@@ -202,26 +271,60 @@
 
       if (keepCentered.checked) map.setView([lat, lon]);
 
-      // 初期アナウンスがまだなら常に試行（候補0のときはスルー。フラグは倒さない）
-      if (tracking && !initialAnnounced) {
-        tryAnnounceInitial(); // 条件が揃ったタイミングで確実に発話
+      // 開始直後はまず初期まとめ、終わっていれば通常の最寄り案内
+      if (!initialAnnounced) {
+        announceInitialIfAny();
       } else if (tracking) {
-        maybeAnnounceNearestPOI(lat, lon); // 通常運転
+        maybeAnnounceNearestPOI(lat, lon);
       }
     }
     function onLocErr(err){ console.warn(err); }
 
+    // ★ 開始ボタン直後：単発測位→即判定（“その場で”必ず案内）
+    function singleShotCheckNow(){
+      try{
+        navigator.geolocation.getCurrentPosition(
+          async pos=>{
+            if(!tracking) return;
+            lastPos = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+            carMarker.setLatLng([lastPos.lat, lastPos.lon]);
+            if (!initialAnnounced) await announceInitialIfAny();
+          },
+          _=>{}, { enableHighAccuracy:true, timeout:5000, maximumAge:15000 }
+        );
+      }catch(_){}
+    }
+
+    // ★ 開始後20秒間：2秒ごとに再試行（KML/測位の遅延保険）
+    let startupSweepTimer=null, startupSweepRemain=0;
+    function startStartupSweep(){
+      if (startupSweepTimer) clearInterval(startupSweepTimer);
+      startupSweepRemain = 10; // 2s * 10 = 20s
+      startupSweepTimer = setInterval(()=>{
+        if (initialAnnounced || !tracking || --startupSweepRemain<=0){
+          clearInterval(startupSweepTimer); startupSweepTimer=null; return;
+        }
+        announceInitialIfAny();
+      }, 2000);
+    }
+
+    /* ===== 追跡開始/終了 ===== */
     async function startTracking(){
       if (tracking) return;
       tracking = true;
+      initialAnnounced=false;
       resetTripStats();
-      points = []; updateCounts();
+      points=[]; poly.setLatLngs([]); updateCounts();
 
       startBtn.disabled = true; stopBtn.disabled = false; cpBtn.disabled = false;
       fabStop.style.display = 'block';
 
       await speakAsync('追跡を開始します。');
-      ensurePositionThenAnnounce();  // 位置がまだ無ければ1回取得→初期発話を試行
+
+      // 直ちに“その場”で判定
+      singleShotCheckNow();
+      // 取りこぼし保険（20秒間）
+      startStartupSweep();
 
       if (!watching) {
         watching = navigator.geolocation.watchPosition(
@@ -253,8 +356,6 @@
           }
         }
       }
-      // 次回のために初期アナウンス状態をリセット
-      initialAnnounced = false;
     }
 
     startBtn.addEventListener('click', startTracking);
@@ -320,94 +421,11 @@
       alert('保存しました（ダウンロード）');
     }
 
-    /* ===== POI 読み上げ（近傍優先 & 初期まとめ読み） ===== */
-    const notifyRangeInput=document.getElementById('notifyRange');
-    const notifyRangeVal=document.getElementById('notifyRangeVal');
-    notifyRangeInput.addEventListener('input',()=>{ notifyRangeVal.textContent=notifyRangeInput.value; });
-
-    const poiList=[];
-    function htmlToPlain(html){
-      if(!html) return '';
-      const el=document.createElement('div'); el.innerHTML=html;
-      return (el.textContent||el.innerText||'').replace(/\s+/g,' ').trim();
-    }
-    function collectPOIsFromGeoJSON(gj){
-      (gj.features||[]).forEach(f=>{
-        if(!f||!f.geometry) return;
-        const props=f.properties||{};
-        if(f.geometry.type==='Point'){
-          const [lon,lat]=f.geometry.coordinates;
-          poiList.push({lat,lon,title:props.name||props.Title||'', memo:htmlToPlain(props.description||props.Description), notified:false});
-        } else if (f.geometry.type==='GeometryCollection' && Array.isArray(f.geometry.geometries)){
-          f.geometry.geometries.forEach(g=>{
-            if(g.type==='Point'){
-              const [lon,lat]=g.coordinates;
-              poiList.push({lat,lon,title:props.name||props.Title||'', memo:htmlToPlain(props.description||props.Description), notified:false});
-            }
-          });
-        }
-      });
-    }
-    function haversineMeters(lat1,lon1,lat2,lon2){
-      const R=6371000,toRad=x=>x*Math.PI/180;
-      const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
-      const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
-      return 2*R*Math.asin(Math.sqrt(a));
-    }
-
-    // 通常走行中：半径内の最寄り1件（クールダウン）
-    let lastSpeakAt=0; const MIN_SPEAK_INTERVAL_MS=5000;
-    async function maybeAnnounceNearestPOI(lat,lon){
-      if (!initialAnnounced) return; // 初期まとめ前は抑止
-      const range=parseFloat(notifyRangeInput.value||'120');
-      const candidates=poiList
-        .filter(p=>!p.notified && haversineMeters(lat,lon,p.lat,p.lon)<=range)
-        .map(p=>({p,d:haversineMeters(lat,lon,p.lat,p.lon)}))
-        .sort((a,b)=>a.d-b.d);
-      if(!candidates.length) return;
-      const now=Date.now(); if(now-lastSpeakAt<MIN_SPEAK_INTERVAL_MS) return;
-      const nearest=candidates[0].p; const d=Math.round(candidates[0].d);
-      const text=[nearest.title, nearest.memo].filter(Boolean).join('。') || '評価ポイント';
-      await speakAsync(`${text}。距離 ${d} メートル。`);
-      nearest.notified=true; lastSpeakAt=Date.now();
-    }
-
-    // 初期まとめ読み上げ：半径内の全件を近い順に（※実際に読んだら初期済みに）
-    function getInRangeSorted(lat, lon){
-      const range=parseFloat(notifyRangeInput.value||'120');
-      return poiList
-        .filter(p=>!p.notified && haversineMeters(lat,lon,p.lat,p.lon)<=range)
-        .map(p=>({p,d:haversineMeters(lat,lon,p.lat,p.lon)}))
-        .sort((a,b)=>a.d-b.d);
-    }
-    async function tryAnnounceInitial(){
-      if (initialAnnounced || !tracking || !lastPos || !poiList.length) return;
-      const list = getInRangeSorted(lastPos.lat, lastPos.lon);
-      if (!list.length) return; // ★ フラグは倒さない：あとで候補ができたら再試行する
-      // 読む → 読めたら初期済みにする
-      for (const {p,d} of list){
-        p.notified = true; // 重複防止
-        const text = [p.title, p.memo].filter(Boolean).join('。') || '評価ポイント';
-        await speakAsync(`${text}。距離 ${Math.round(d)} メートル。`);
-      }
-      initialAnnounced = true;
-      lastSpeakAt = Date.now();
-    }
-    function ensurePositionThenAnnounce(){
-      if (lastPos){ tryAnnounceInitial(); return; }
-      if (navigator.geolocation?.getCurrentPosition){
-        navigator.geolocation.getCurrentPosition(p=>{
-          lastPos = { lat:p.coords.latitude, lon:p.coords.longitude };
-          tryAnnounceInitial();
-        }, ()=>{}, { enableHighAccuracy:true, timeout:5000 });
-      }
-    }
-
-    /* ===== KML/KMZ 読み込み & セレクト ===== */
+    /* ===== KML/KMZ 読み込み ===== */
     const fileInput=document.getElementById('file');
     const datasetSelect=document.getElementById('datasetSelect');
     const placeholderOpt = datasetSelect.querySelector('option[value=""]');
-    const datasetsByValue = new Map();
+    const datasetsByValue = new Map(); // value -> {name, layer}
 
     function activateDatasetSelect(){
       if (placeholderOpt){ placeholderOpt.disabled = true; placeholderOpt.selected = false; }
@@ -436,8 +454,8 @@
           }
         }
       }
-      // ファイル読込後にも初期判定を試行（ここでもフラグは倒さない）
-      tryAnnounceInitial();
+      // 読み込み後にも（開始済みなら）初期アナウンス再試行
+      announceInitialIfAny();
     });
 
     function addDataset(name, gj){
@@ -459,7 +477,8 @@
       activateDatasetSelect();
       collectPOIsFromGeoJSON(gj);
 
-      tryAnnounceInitial(); // 位置が既にあれば即発話
+      // 位置が既に出ていて開始済みなら即判定
+      announceInitialIfAny();
     }
 
     datasetSelect.addEventListener('change', ()=>{
@@ -486,11 +505,12 @@
     if (navigator.geolocation?.getCurrentPosition){
       navigator.geolocation.getCurrentPosition(p=>{
         lastPos = { lat:p.coords.latitude, lon:p.coords.longitude };
-        tryAnnounceInitial();
+        carMarker.setLatLng([lastPos.lat, lastPos.lon]);
+        announceInitialIfAny();
       }, ()=>{}, { enableHighAccuracy:true, timeout:5000 });
     }
 
-    // 初期状態
+    // 初期表示更新
     updateCounts();
     updateHUD();
 
